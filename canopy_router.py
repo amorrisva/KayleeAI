@@ -34,14 +34,18 @@ def load_config(config_path: str) -> dict:
         "staging_dir": "",
         "mapping_csv": "",
         "output_dir": "",
+        "teams_webhook": "",
     }
     if os.path.isfile(config_path):
         cp = configparser.ConfigParser()
         cp.read(config_path)
         if cp.has_section("paths"):
-            for key in defaults:
+            for key in ["staging_dir", "mapping_csv", "output_dir"]:
                 if cp.has_option("paths", key):
                     defaults[key] = cp.get("paths", key)
+        if cp.has_section("notifications"):
+            if cp.has_option("notifications", "teams_webhook"):
+                defaults["teams_webhook"] = cp.get("notifications", "teams_webhook").strip()
     return defaults
 
 

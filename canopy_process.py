@@ -688,6 +688,7 @@ def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     config = load_config(os.path.join(script_dir, "config.ini"))
     staging_dir = args.staging_dir or config.get("staging_dir") or os.path.dirname(script_dir)
+    teams_webhook = args.teams_webhook or config.get("teams_webhook", "")
 
     setup_dirs(staging_dir)
     logger = setup_logging(staging_dir)
@@ -710,11 +711,11 @@ def main():
                         if f.lower().endswith(".pdf")
                         and os.path.isfile(os.path.join(staging_dir, f))]
                 if pdfs:
-                    results = process_files(staging_dir, args.dry_run, args.teams_webhook)
+                    results = process_files(staging_dir, args.dry_run, teams_webhook)
                     print_summary(results)
                 time.sleep(args.interval)
         else:
-            results = process_files(staging_dir, args.dry_run, args.teams_webhook)
+            results = process_files(staging_dir, args.dry_run, teams_webhook)
             if results.get("total", 0) > 0:
                 print_summary(results)
             else:
