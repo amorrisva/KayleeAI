@@ -450,21 +450,50 @@ def send_teams_webhook(webhook_url, report_path, results, has_issues):
         f"K-1s: {results['k1_routed']}"
     )
 
+    # Build detail text
+    detail_lines = []
+    if results.get("unmatched_files"):
+        detail_lines.append("**Unmatched Clients:**")
+        for fname, cid in results["unmatched_files"]:
+            detail_lines.append(f"- [{cid}] {fname}")
+    if results.get("failed_files"):
+        detail_lines.append("**Upload Errors:**")
+        for fname, err in results["failed_files"]:
+            detail_lines.append(f"- {fname}: {err}")
+    if results.get("external_k1_files"):
+        detail_lines.append("**External K-1 Recipients (not a client):**")
+        for recip, entity in results["external_k1_files"]:
+            detail_lines.append(f"- {recip} (from {entity})")
+    if results.get("k1_wp_failures"):
+        detail_lines.append("**K-1 Workpaper Failures:**")
+        for fname, recip, err in results["k1_wp_failures"]:
+            detail_lines.append(f"- {fname} -> {recip}: {err}")
+
+    detail_text = "\n\n".join(detail_lines) if detail_lines else "No issues."
+
+    # Only include non-zero facts
+    facts = [{"name": "Total Files", "value": str(results["total"])}]
+    if results["uploaded"]:
+        facts.append({"name": "Uploaded", "value": str(results["uploaded"])})
+    if results.get("replaced", 0):
+        facts.append({"name": "Replaced", "value": str(results["replaced"])})
+    if results["k1_routed"]:
+        facts.append({"name": "K-1s Routed", "value": str(results["k1_routed"])})
+    if results["unmatched"]:
+        facts.append({"name": "Unmatched", "value": str(results["unmatched"])})
+    if results["failed"]:
+        facts.append({"name": "Errors", "value": str(results["failed"])})
+    if results["external_k1"]:
+        facts.append({"name": "External K-1s", "value": str(results["external_k1"])})
+
     payload = {
         "@type": "MessageCard",
         "themeColor": color,
         "summary": title,
         "sections": [{
             "activityTitle": title,
-            "facts": [
-                {"name": "Total Files", "value": str(results["total"])},
-                {"name": "Uploaded", "value": str(results["uploaded"])},
-                {"name": "K-1s Routed", "value": str(results["k1_routed"])},
-                {"name": "Unmatched", "value": str(results["unmatched"])},
-                {"name": "Errors", "value": str(results["failed"])},
-                {"name": "External K-1s", "value": str(results["external_k1"])},
-            ],
-            "text": f"Report saved to: {report_path}" if has_issues else "No issues.",
+            "facts": facts,
+            "text": detail_text,
         }],
     }
 
