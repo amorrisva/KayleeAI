@@ -432,28 +432,33 @@ def generate_report(staging_dir, results, start_time):
 
 
 def send_teams_webhook(webhook_url, report_path, results, has_issues):
-    """Send a summary notification to Teams via webhook."""
+    """Send one Teams card per run.
+
+    Color logic:
+    - Red: real errors (unmatched, upload failures, parse errors)
+    - Orange: no errors but has external K-1s to verify
+    - Green: everything clean
+    """
     if not webhook_url:
         return
 
-    if has_issues:
-        title = "CanopyRouter: Issues Found"
+    import requests as req
+
+    has_real_errors = (results["unmatched"] + results["failed"] +
+                       results["parse_error"] + len(results.get("k1_wp_failures", []))) > 0
+    has_external_k1 = bool(results.get("external_k1_files"))
+
+    if has_real_errors:
         color = "FF0000"
+        title = "CanopyRouter: Action Required"
+    elif has_external_k1:
+        color = "FFA500"
+        title = "CanopyRouter: Files Processed"
     else:
-        title = "CanopyRouter: All Files Processed"
         color = "00FF00"
+        title = "CanopyRouter: All Files Processed"
 
-    summary = (
-        f"Uploaded: {results['uploaded']} | "
-        f"Errors: {results['failed']} | "
-        f"Unmatched: {results['unmatched']} | "
-        f"K-1s: {results['k1_routed']}"
-    )
-
-    # Build sections
-    sections = []
-
-    # Summary section
+    # Summary facts
     facts = [{"name": "Total Files", "value": str(results["total"])}]
     if results["uploaded"]:
         facts.append({"name": "Uploaded", "value": str(results["uploaded"])})
@@ -465,15 +470,10 @@ def send_teams_webhook(webhook_url, report_path, results, has_issues):
         facts.append({"name": "Unmatched", "value": str(results["unmatched"])})
     if results["failed"]:
         facts.append({"name": "Errors", "value": str(results["failed"])})
-    if results["external_k1"]:
-        facts.append({"name": "External K-1s", "value": str(results["external_k1"])})
 
-    sections.append({
-        "activityTitle": title,
-        "facts": facts,
-    })
+    sections = [{"activityTitle": title, "facts": facts}]
 
-    # Successfully processed files
+    # Processed files log
     if results.get("processed_log"):
         log_lines = []
         for entry in results["processed_log"]:
@@ -481,61 +481,62 @@ def send_teams_webhook(webhook_url, report_path, results, has_issues):
             log_lines.append(line)
             if entry.get("k1_dest"):
                 log_lines.append(f"  - K-1 copy -> {entry['k1_dest']}")
-            if entry.get("k1_external"):
-                log_lines.append(f"  - K-1 external: {entry['k1_external']}")
         sections.append({
             "activityTitle": "Processed Files",
             "text": "\n\n".join(log_lines),
         })
 
-    # Issues section
-    issue_lines = []
-    if results.get("unmatched_files"):
-        issue_lines.append("**Unmatched Clients**")
-        issue_lines.append("*Fix: Export a fresh client list from Canopy > Contacts > Export, save to Config/ folder, then move these files back to staging.*")
-        for fname, cid in results["unmatched_files"]:
-            issue_lines.append(f"- [{cid}] {fname}")
-
-    if results.get("failed_files"):
-        issue_lines.append("**Upload Errors**")
-        issue_lines.append("*Fix: Check that Canopy Drive is running on the server, then move these files back to staging.*")
-        for fname, err in results["failed_files"]:
-            issue_lines.append(f"- {fname}: {err}")
-
-    if results.get("external_k1_files"):
-        issue_lines.append("**External K-1 Recipients (not a firm client)**")
-        issue_lines.append("*These K-1s were uploaded to the entity's Tax Files but no workpaper copy was made. No action needed unless the recipient should be a client.*")
+    # External K-1s (informational, not an error)
+    if has_external_k1:
+        ext_lines = []
         for recip, entity in results["external_k1_files"]:
-            issue_lines.append(f"- {recip} (from {entity})")
+            ext_lines.append(f"- **{recip}** (from {entity})")
+        ext_lines.append("")
+        ext_lines.append("*Please verify these external K-1 recipients. They are not firm clients -- no workpaper copy was created.*")
+        sections.append({
+            "activityTitle": "External K-1 Recipients - Please Verify",
+            "text": "\n\n".join(ext_lines),
+        })
 
-    if results.get("k1_wp_failures"):
-        issue_lines.append("**K-1 Workpaper Copy Failures**")
-        issue_lines.append("*Fix: Manually upload the K-1 to the recipient's Workpapers folder in Canopy.*")
-        for fname, recip, err in results["k1_wp_failures"]:
-            issue_lines.append(f"- {fname} -> {recip}: {err}")
+    # Real errors with fix instructions
+    if has_real_errors:
+        issue_lines = []
+        if results.get("unmatched_files"):
+            issue_lines.append("**Unmatched Clients**")
+            issue_lines.append("*Fix: Export a fresh client list from Canopy > Contacts > Export, save to Config/ folder, then move these files back to staging.*")
+            for fname, cid in results["unmatched_files"]:
+                issue_lines.append(f"- [{cid}] {fname}")
 
-    if results.get("parse_errors"):
-        issue_lines.append("**Parse Errors (bad filename format)**")
-        issue_lines.append("*Fix: Reprint from UltraTax with Client ID in Position 1.*")
-        for fname in results["parse_errors"]:
-            issue_lines.append(f"- {fname}")
+        if results.get("failed_files"):
+            issue_lines.append("**Upload Errors**")
+            issue_lines.append("*Fix: Check that Canopy Drive is running on the server, then move these files back to staging.*")
+            for fname, err in results["failed_files"]:
+                issue_lines.append(f"- {fname}: {err}")
 
-    if issue_lines:
+        if results.get("k1_wp_failures"):
+            issue_lines.append("**K-1 Workpaper Copy Failures**")
+            issue_lines.append("*Fix: Manually upload the K-1 to the recipient's Workpapers folder in Canopy.*")
+            for fname, recip, err in results["k1_wp_failures"]:
+                issue_lines.append(f"- {fname} -> {recip}: {err}")
+
+        if results.get("parse_errors"):
+            issue_lines.append("**Parse Errors (bad filename format)**")
+            issue_lines.append("*Fix: Reprint from UltraTax with Client ID in Position 1.*")
+            for fname in results["parse_errors"]:
+                issue_lines.append(f"- {fname}")
+
         sections.append({
             "activityTitle": "Issues & How to Fix",
             "text": "\n\n".join(issue_lines),
         })
 
-    payload = {
-        "@type": "MessageCard",
-        "themeColor": color,
-        "summary": title,
-        "sections": sections,
-    }
-
     try:
-        import requests as req
-        req.post(webhook_url, json=payload, timeout=10)
+        req.post(webhook_url, json={
+            "@type": "MessageCard",
+            "themeColor": color,
+            "summary": title,
+            "sections": sections,
+        }, timeout=10)
     except Exception as e:
         logging.warning(f"Teams notification failed: {e}")
 
