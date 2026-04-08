@@ -1,31 +1,24 @@
 #!/usr/bin/env python3
 """
-CanopyRouter Phase 2 -- Automated upload to Canopy via local sync daemon API.
+CanopyRouter -- Canopy sync daemon API client.
 
-Usage:
-    python canopy_upload_final.py                   # dry-run
-    python canopy_upload_final.py --go              # upload all files
-    python canopy_upload_final.py --go --start 5    # start from file #5
-    python canopy_upload_final.py --go --overwrite  # overwrite existing files
+Uploads files to Canopy via the local sync daemon REST API.
+Handles authentication, folder creation, duplicate replacement,
+and connection recovery.
 """
 
-import argparse
 import base64
 import hashlib
 import json
+import logging
 import os
 import re
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from canopy_router import (
-    load_config,
-    find_mapping_csv,
-    load_canopy_mapping,
-)
-
 import requests
+
+logger = logging.getLogger("canopy_upload")
 
 GATEWAY_MOUNT = os.path.join(
     os.environ.get("LOCALAPPDATA", ""),
@@ -35,6 +28,16 @@ GATEWAY_MOUNT = os.path.join(
 
 class CanopyUploader:
     def __init__(self):
+        self._folder_cache = set()
+        self._load_mount()
+
+    def _load_mount(self):
+        """Read daemon URL and token from mount.json."""
+        if not os.path.isfile(GATEWAY_MOUNT):
+            raise FileNotFoundError(
+                f"Canopy Drive is not installed or the service is not running.\n"
+                f"Expected: {GATEWAY_MOUNT}"
+            )
         with open(GATEWAY_MOUNT, "r") as f:
             mounts = json.load(f)
         self.base_url = mounts[0]["gateway.url"]
@@ -45,79 +48,168 @@ class CanopyUploader:
             "Authorization": f"Bearer {self.token}",
         })
 
+    def _reconnect(self):
+        """Re-read mount.json and re-authenticate (port may have changed)."""
+        logger.info("Reconnecting -- re-reading mount.json")
+        try:
+            self._load_mount()
+            return self.authenticate()
+        except Exception as e:
+            logger.error(f"Reconnect failed: {e}")
+            return False
+
     def authenticate(self):
         url = f"{self.base_url}/v2/gateway_auth"
-        resp = self.session.post(url, json={
-            "gateway.auth.access.token": self.token,
-        }, timeout=10)
+        try:
+            resp = self.session.post(url, json={
+                "gateway.auth.access.token": self.token,
+            }, timeout=10)
+        except requests.ConnectionError:
+            logger.warning("Connection refused during auth -- daemon may have restarted")
+            return self._reconnect() if not hasattr(self, "_reconnecting") else False
         if resp.ok:
             data = resp.json()
             self.token = data.get("gateway.auth.access.token", self.token)
             self.session.headers["Authorization"] = f"Bearer {self.token}"
             return True
+        logger.error(f"Auth failed: HTTP {resp.status_code}")
         return False
 
-    def folder_exists(self, remote_path):
+    def _api_call(self, method, url, retries=2, **kwargs):
+        """Make an API call with retry on connection errors."""
+        kwargs.setdefault("timeout", 30)
+        for attempt in range(retries + 1):
+            try:
+                resp = self.session.request(method, url, **kwargs)
+                if resp.status_code == 401:
+                    if self.authenticate():
+                        continue
+                    return resp
+                return resp
+            except (requests.ConnectionError, requests.Timeout) as e:
+                if attempt < retries:
+                    logger.warning(f"Connection error (attempt {attempt + 1}): {e}")
+                    time.sleep(2)
+                    if isinstance(e, requests.ConnectionError):
+                        self._reconnect()
+                else:
+                    raise
+        return None
+
+    def list_folder(self, remote_path):
+        """List contents of a remote folder. Returns list of items or None."""
         encoded = base64.b64encode(remote_path.encode()).decode()
         url = f"{self.base_url}/v2/gateway_metadata_children/{encoded}"
-        resp = self.session.get(url, timeout=15)
-        return resp.status_code == 200
+        try:
+            resp = self._api_call("GET", url)
+            if resp and resp.ok:
+                return resp.json()
+        except Exception as e:
+            logger.debug(f"list_folder({remote_path}): {e}")
+        return None
+
+    def folder_exists(self, remote_path):
+        if remote_path in self._folder_cache:
+            return True
+        encoded = base64.b64encode(remote_path.encode()).decode()
+        url = f"{self.base_url}/v2/gateway_metadata_children/{encoded}"
+        try:
+            resp = self._api_call("GET", url)
+            if resp and resp.status_code == 200:
+                self._folder_cache.add(remote_path)
+                return True
+        except Exception:
+            pass
+        return False
 
     def create_folder(self, parent_path, folder_name):
-        """Create a subfolder under parent_path.
-
-        Returns True if created or already exists.
-        """
         encoded = base64.b64encode(parent_path.encode()).decode()
         url = f"{self.base_url}/v2/gateway_metadata_folder/{encoded}"
-        resp = self.session.post(url, json={
-            "gateway.metadata.name": folder_name,
-        }, timeout=15)
-        return resp.status_code == 200
+        try:
+            resp = self._api_call("POST", url, json={
+                "gateway.metadata.name": folder_name,
+            })
+            if resp and resp.status_code == 200:
+                full_path = f"{parent_path.rstrip('/')}/{folder_name}"
+                self._folder_cache.add(full_path)
+                return True
+        except Exception as e:
+            logger.error(f"create_folder({parent_path}/{folder_name}): {e}")
+        return False
 
     def ensure_folder(self, remote_path):
-        """Ensure the full folder path exists, creating segments as needed.
-
-        e.g. /Clients/Name/2022/Tax/Workpapers
-        Creates 2022, Tax, and Workpapers if they don't exist.
-        """
         if self.folder_exists(remote_path):
             return True
 
-        # Walk up to find the deepest existing folder, then create down
         parts = remote_path.strip("/").split("/")
-        existing = ""
         create_from = 0
 
         for i in range(len(parts)):
             test_path = "/" + "/".join(parts[:i + 1])
             if self.folder_exists(test_path):
-                existing = test_path
                 create_from = i + 1
             else:
                 break
 
-        # Create missing folders
         for i in range(create_from, len(parts)):
             parent = "/" + "/".join(parts[:i]) if i > 0 else "/"
-            folder_name = parts[i]
-            if not self.create_folder(parent, folder_name):
+            if not self.create_folder(parent, parts[i]):
                 return False
 
         return self.folder_exists(remote_path)
 
-    def upload_file(self, local_path, remote_folder, skip_existing=True):
-        """Upload a single file to a Canopy remote folder.
+    def delete_file(self, remote_path, file_id):
+        """Delete a file from Canopy by its metadata ID."""
+        url = f"{self.base_url}/v2/gateway_metadata/{file_id}"
+        try:
+            resp = self._api_call("DELETE", url)
+            if resp and resp.status_code == 200:
+                logger.info(f"Deleted: {remote_path}")
+                return True
+            logger.warning(f"Delete failed: HTTP {resp.status_code if resp else '?'}")
+        except Exception as e:
+            logger.warning(f"Delete failed: {e}")
+        return False
+
+    def find_existing_file(self, remote_folder, filename):
+        """Check if a file already exists in the remote folder.
+
+        Returns (file_id, existing_name) or (None, None).
+        """
+        items = self.list_folder(remote_folder)
+        if not items:
+            return None, None
+        for item in items:
+            if item.get("gateway.metadata.name") == filename:
+                return item.get("gateway.metadata.id"), filename
+        return None, None
+
+    def upload_file(self, local_path, remote_folder, replace_existing=True):
+        """Upload a file to a Canopy remote folder.
+
+        If replace_existing is True and the file already exists,
+        deletes the old version first so there's never a (1) duplicate.
 
         Returns (success: bool, message: str)
         """
         filename = os.path.basename(local_path)
-        with open(local_path, "rb") as f:
-            file_data = f.read()
+
+        try:
+            with open(local_path, "rb") as f:
+                file_data = f.read()
+        except (OSError, PermissionError) as e:
+            return False, f"Cannot read file: {e}"
 
         file_size = len(file_data)
         file_sha256 = hashlib.sha256(file_data).hexdigest()
         mtime_ms = int(os.path.getmtime(local_path) * 1000)
+
+        # Delete existing file if present (prevents duplicates)
+        if replace_existing:
+            existing_id, existing_name = self.find_existing_file(remote_folder, filename)
+            if existing_id:
+                self.delete_file(remote_folder, existing_id)
+                logger.info(f"Replaced existing: {filename}")
 
         encoded = base64.b64encode(remote_folder.encode()).decode()
         url = f"{self.base_url}/v2/gateway_metadata_file/{encoded}"
@@ -129,163 +221,47 @@ class CanopyUploader:
             "gateway.metadata.modified": mtime_ms,
         }
 
-        resp = self.session.post(
-            url,
-            data=file_data,
-            headers={
-                "Content-Type": "application/octet-stream",
-                "X-Gateway-Upload": json.dumps(metadata),
-            },
-            timeout=120,
-        )
+        try:
+            resp = self._api_call(
+                "POST", url,
+                data=file_data,
+                headers={
+                    "Content-Type": "application/octet-stream",
+                    "X-Gateway-Upload": json.dumps(metadata),
+                },
+                timeout=120,
+            )
+        except (requests.ConnectionError, requests.Timeout) as e:
+            return False, f"Connection error: {e}"
+        except Exception as e:
+            return False, f"Upload error: {e}"
+
+        if not resp:
+            return False, "No response from server"
 
         if resp.status_code == 200:
             resp_data = resp.json()
             uploaded_name = resp_data.get("gateway.metadata.name", filename)
             if "(1)" in uploaded_name or "(2)" in uploaded_name:
-                return True, f"OK (duplicate: {uploaded_name})"
+                return True, f"OK (version: {uploaded_name})"
             return True, "OK"
-        elif resp.status_code == 409:
-            return True, "SKIP (exists)"
-        elif resp.status_code == 401:
-            if self.authenticate():
-                return self.upload_file(local_path, remote_folder, skip_existing)
-            return False, "AUTH FAILED"
         elif resp.status_code == 403:
-            # Folder probably doesn't exist -- try creating it
             if self.ensure_folder(remote_folder):
-                # Retry upload
-                resp = self.session.post(
-                    url,
-                    data=file_data,
-                    headers={
-                        "Content-Type": "application/octet-stream",
-                        "X-Gateway-Upload": json.dumps(metadata),
-                    },
-                    timeout=120,
-                )
-                if resp.status_code == 200:
-                    return True, "OK (folder created)"
-                reason = resp.headers.get("X-Reason", resp.text[:100])
-                return False, f"HTTP {resp.status_code} after folder creation: {reason}"
+                try:
+                    resp = self._api_call(
+                        "POST", url,
+                        data=file_data,
+                        headers={
+                            "Content-Type": "application/octet-stream",
+                            "X-Gateway-Upload": json.dumps(metadata),
+                        },
+                        timeout=120,
+                    )
+                    if resp and resp.status_code == 200:
+                        return True, "OK (folder created)"
+                except Exception as e:
+                    return False, f"Upload after folder creation failed: {e}"
             return False, "HTTP 403: Could not create folder"
         else:
             reason = resp.headers.get("X-Reason", resp.text[:100])
             return False, f"HTTP {resp.status_code}: {reason}"
-
-
-def build_file_list(routed_dir, mapping):
-    files = []
-    for folder in sorted(os.listdir(routed_dir)):
-        folder_path = os.path.join(routed_dir, folder)
-        if not os.path.isdir(folder_path) or folder.startswith("_"):
-            continue
-        match = re.match(r"^(\S+)\s*-\s*(.+)$", folder)
-        if not match:
-            continue
-        client_id = match.group(1)
-        if client_id not in mapping:
-            continue
-        canopy_name = mapping[client_id].rstrip(".")
-        for pdf in sorted(os.listdir(folder_path)):
-            if not pdf.lower().endswith(".pdf"):
-                continue
-            year_match = re.search(r"\b(20\d{2})\b", pdf)
-            if not year_match:
-                continue
-            tax_year = year_match.group(1)
-            files.append({
-                "local_path": os.path.join(folder_path, pdf),
-                "remote_path": f"/Clients/{canopy_name}/{tax_year}/Tax/Tax Files",
-                "filename": pdf,
-                "client_id": client_id,
-                "canopy_name": canopy_name,
-            })
-    return files
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Upload routed PDFs to Canopy via sync daemon API."
-    )
-    parser.add_argument("--go", action="store_true", help="Execute uploads")
-    parser.add_argument("--start", type=int, default=1, help="Start from file #")
-    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing files")
-    parser.add_argument("--routed-dir", help="Path to Routed/ directory")
-    parser.add_argument("--mapping-csv", help="Path to Canopy CSV")
-    args = parser.parse_args()
-
-    # Load config and mapping
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    config = load_config(os.path.join(script_dir, "config.ini"))
-    base_staging = config.get("staging_dir") or os.path.dirname(script_dir)
-    routed_dir = args.routed_dir or os.path.join(base_staging, "Routed")
-    mapping_csv = args.mapping_csv or config.get("mapping_csv") or find_mapping_csv(base_staging)
-
-    if not os.path.isdir(routed_dir):
-        print(f"ERROR: Routed directory not found: {routed_dir}")
-        sys.exit(1)
-
-    mapping = load_canopy_mapping(mapping_csv)
-    files = build_file_list(routed_dir, mapping)
-
-    # Connect to Canopy
-    uploader = CanopyUploader()
-    print(f"CanopyRouter Upload")
-    print(f"{'=' * 50}")
-    print(f"  Daemon:   {uploader.base_url}")
-    print(f"  Files:    {len(files)}")
-    print(f"  Mode:     {'UPLOAD' if args.go else 'DRY RUN'}")
-    print(f"{'=' * 50}")
-
-    print("\nAuthenticating...", end=" ")
-    if uploader.authenticate():
-        print("OK")
-    else:
-        print("FAILED")
-        sys.exit(1)
-
-    if not args.go:
-        for i, f in enumerate(files, 1):
-            if i < args.start:
-                continue
-            print(f"  [{i}/{len(files)}] {f['filename']}")
-            print(f"           -> {f['remote_path']}")
-        print(f"\nDry run. Use --go to upload.")
-        return
-
-    print()
-    success = 0
-    failed = 0
-    failed_list = []
-
-    for i, f in enumerate(files, 1):
-        if i < args.start:
-            continue
-
-        print(f"  [{i}/{len(files)}] {f['filename']} ... ", end="", flush=True)
-
-        ok, msg = uploader.upload_file(f["local_path"], f["remote_path"])
-
-        if ok:
-            print(msg)
-            success += 1
-        else:
-            print(msg)
-            failed += 1
-            failed_list.append((f["filename"], msg))
-
-        time.sleep(0.5)
-
-    print(f"\n{'=' * 50}")
-    print(f"Uploaded:  {success}")
-    print(f"Failed:    {failed}")
-
-    if failed_list:
-        print(f"\nFailed files:")
-        for fname, msg in failed_list:
-            print(f"  {fname}: {msg}")
-
-
-if __name__ == "__main__":
-    main()
