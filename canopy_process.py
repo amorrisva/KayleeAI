@@ -450,28 +450,10 @@ def send_teams_webhook(webhook_url, report_path, results, has_issues):
         f"K-1s: {results['k1_routed']}"
     )
 
-    # Build detail text
-    detail_lines = []
-    if results.get("unmatched_files"):
-        detail_lines.append("**Unmatched Clients:**")
-        for fname, cid in results["unmatched_files"]:
-            detail_lines.append(f"- [{cid}] {fname}")
-    if results.get("failed_files"):
-        detail_lines.append("**Upload Errors:**")
-        for fname, err in results["failed_files"]:
-            detail_lines.append(f"- {fname}: {err}")
-    if results.get("external_k1_files"):
-        detail_lines.append("**External K-1 Recipients (not a client):**")
-        for recip, entity in results["external_k1_files"]:
-            detail_lines.append(f"- {recip} (from {entity})")
-    if results.get("k1_wp_failures"):
-        detail_lines.append("**K-1 Workpaper Failures:**")
-        for fname, recip, err in results["k1_wp_failures"]:
-            detail_lines.append(f"- {fname} -> {recip}: {err}")
+    # Build sections
+    sections = []
 
-    detail_text = "\n\n".join(detail_lines) if detail_lines else "No issues."
-
-    # Only include non-zero facts
+    # Summary section
     facts = [{"name": "Total Files", "value": str(results["total"])}]
     if results["uploaded"]:
         facts.append({"name": "Uploaded", "value": str(results["uploaded"])})
@@ -486,15 +468,69 @@ def send_teams_webhook(webhook_url, report_path, results, has_issues):
     if results["external_k1"]:
         facts.append({"name": "External K-1s", "value": str(results["external_k1"])})
 
+    sections.append({
+        "activityTitle": title,
+        "facts": facts,
+    })
+
+    # Successfully processed files
+    if results.get("processed_log"):
+        log_lines = []
+        for entry in results["processed_log"]:
+            line = f"- **{entry['renamed']}** -> {entry['client']}/{entry['year']}/Tax/Tax Files"
+            log_lines.append(line)
+            if entry.get("k1_dest"):
+                log_lines.append(f"  - K-1 copy -> {entry['k1_dest']}")
+            if entry.get("k1_external"):
+                log_lines.append(f"  - K-1 external: {entry['k1_external']}")
+        sections.append({
+            "activityTitle": "Processed Files",
+            "text": "\n\n".join(log_lines),
+        })
+
+    # Issues section
+    issue_lines = []
+    if results.get("unmatched_files"):
+        issue_lines.append("**Unmatched Clients**")
+        issue_lines.append("*Fix: Export a fresh client list from Canopy > Contacts > Export, save to Config/ folder, then move these files back to staging.*")
+        for fname, cid in results["unmatched_files"]:
+            issue_lines.append(f"- [{cid}] {fname}")
+
+    if results.get("failed_files"):
+        issue_lines.append("**Upload Errors**")
+        issue_lines.append("*Fix: Check that Canopy Drive is running on the server, then move these files back to staging.*")
+        for fname, err in results["failed_files"]:
+            issue_lines.append(f"- {fname}: {err}")
+
+    if results.get("external_k1_files"):
+        issue_lines.append("**External K-1 Recipients (not a firm client)**")
+        issue_lines.append("*These K-1s were uploaded to the entity's Tax Files but no workpaper copy was made. No action needed unless the recipient should be a client.*")
+        for recip, entity in results["external_k1_files"]:
+            issue_lines.append(f"- {recip} (from {entity})")
+
+    if results.get("k1_wp_failures"):
+        issue_lines.append("**K-1 Workpaper Copy Failures**")
+        issue_lines.append("*Fix: Manually upload the K-1 to the recipient's Workpapers folder in Canopy.*")
+        for fname, recip, err in results["k1_wp_failures"]:
+            issue_lines.append(f"- {fname} -> {recip}: {err}")
+
+    if results.get("parse_errors"):
+        issue_lines.append("**Parse Errors (bad filename format)**")
+        issue_lines.append("*Fix: Reprint from UltraTax with Client ID in Position 1.*")
+        for fname in results["parse_errors"]:
+            issue_lines.append(f"- {fname}")
+
+    if issue_lines:
+        sections.append({
+            "activityTitle": "Issues & How to Fix",
+            "text": "\n\n".join(issue_lines),
+        })
+
     payload = {
         "@type": "MessageCard",
         "themeColor": color,
         "summary": title,
-        "sections": [{
-            "activityTitle": title,
-            "facts": facts,
-            "text": detail_text,
-        }],
+        "sections": sections,
     }
 
     try:
@@ -550,6 +586,7 @@ def process_files(staging_dir, dry_run=False, teams_webhook=None):
         "total": len(pdfs), "uploaded": 0, "k1_routed": 0,
         "unmatched": 0, "failed": 0, "parse_error": 0,
         "external_k1": 0, "replaced": 0,
+        "processed_log": [],
         "unmatched_files": [], "failed_files": [], "parse_errors": [],
         "external_k1_files": [], "k1_wp_failures": [],
     }
@@ -635,6 +672,16 @@ def process_files(staging_dir, dry_run=False, teams_webhook=None):
             logging.info(f"  [{idx}/{len(pdfs)}] OK: {new_name} -> {canopy_name}/{year}/Tax/Tax Files/")
             results["uploaded"] += 1
 
+            # Track for notification
+            log_entry = {
+                "original": pdf,
+                "renamed": new_name,
+                "client": canopy_name,
+                "year": year,
+                "k1_dest": None,
+                "k1_external": None,
+            }
+
             # K-1 workpaper routing
             if "K1" in parsed.get("doc_type", "") and parsed.get("recipient"):
                 recipient = parsed["recipient"]
@@ -664,6 +711,7 @@ def process_files(staging_dir, dry_run=False, teams_webhook=None):
                     if ok2:
                         logging.info(f"    K1 -> {recip_canopy_name}/Workpapers/ [{method}]")
                         results["k1_routed"] += 1
+                        log_entry["k1_dest"] = f"{recip_canopy_name}/Workpapers [{method}]"
                     else:
                         logging.warning(f"    K1 FAIL -> {recip_canopy_name}: {msg2}")
                         results["k1_wp_failures"].append((new_name, recip_canopy_name, msg2))
@@ -671,6 +719,9 @@ def process_files(staging_dir, dry_run=False, teams_webhook=None):
                     logging.info(f"    K1 EXTERNAL: {recipient} (not a client)")
                     results["external_k1"] += 1
                     results["external_k1_files"].append((recipient, canopy_name))
+                    log_entry["k1_external"] = recipient
+
+            results["processed_log"].append(log_entry)
 
             # Move to Processed
             move_file(src, PROCESSED_DIR, staging_dir)
