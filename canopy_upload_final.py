@@ -63,6 +63,49 @@ class CanopyUploader:
         resp = self.session.get(url, timeout=15)
         return resp.status_code == 200
 
+    def create_folder(self, parent_path, folder_name):
+        """Create a subfolder under parent_path.
+
+        Returns True if created or already exists.
+        """
+        encoded = base64.b64encode(parent_path.encode()).decode()
+        url = f"{self.base_url}/v2/gateway_metadata_folder/{encoded}"
+        resp = self.session.post(url, json={
+            "gateway.metadata.name": folder_name,
+        }, timeout=15)
+        return resp.status_code == 200
+
+    def ensure_folder(self, remote_path):
+        """Ensure the full folder path exists, creating segments as needed.
+
+        e.g. /Clients/Name/2022/Tax/Workpapers
+        Creates 2022, Tax, and Workpapers if they don't exist.
+        """
+        if self.folder_exists(remote_path):
+            return True
+
+        # Walk up to find the deepest existing folder, then create down
+        parts = remote_path.strip("/").split("/")
+        existing = ""
+        create_from = 0
+
+        for i in range(len(parts)):
+            test_path = "/" + "/".join(parts[:i + 1])
+            if self.folder_exists(test_path):
+                existing = test_path
+                create_from = i + 1
+            else:
+                break
+
+        # Create missing folders
+        for i in range(create_from, len(parts)):
+            parent = "/" + "/".join(parts[:i]) if i > 0 else "/"
+            folder_name = parts[i]
+            if not self.create_folder(parent, folder_name):
+                return False
+
+        return self.folder_exists(remote_path)
+
     def upload_file(self, local_path, remote_folder, skip_existing=True):
         """Upload a single file to a Canopy remote folder.
 
@@ -105,10 +148,27 @@ class CanopyUploader:
         elif resp.status_code == 409:
             return True, "SKIP (exists)"
         elif resp.status_code == 401:
-            # Token expired, re-auth and retry
             if self.authenticate():
                 return self.upload_file(local_path, remote_folder, skip_existing)
             return False, "AUTH FAILED"
+        elif resp.status_code == 403:
+            # Folder probably doesn't exist -- try creating it
+            if self.ensure_folder(remote_folder):
+                # Retry upload
+                resp = self.session.post(
+                    url,
+                    data=file_data,
+                    headers={
+                        "Content-Type": "application/octet-stream",
+                        "X-Gateway-Upload": json.dumps(metadata),
+                    },
+                    timeout=120,
+                )
+                if resp.status_code == 200:
+                    return True, "OK (folder created)"
+                reason = resp.headers.get("X-Reason", resp.text[:100])
+                return False, f"HTTP {resp.status_code} after folder creation: {reason}"
+            return False, "HTTP 403: Could not create folder"
         else:
             reason = resp.headers.get("X-Reason", resp.text[:100])
             return False, f"HTTP {resp.status_code}: {reason}"
