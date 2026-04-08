@@ -24,6 +24,20 @@ import re
 import sys
 import time
 
+try:
+    import pdfplumber
+except ImportError:
+    import subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "pdfplumber"])
+    import pdfplumber
+
+try:
+    import openpyxl
+except ImportError:
+    import subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "openpyxl"])
+    import openpyxl
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from canopy_router import (
     load_config,
@@ -39,6 +53,74 @@ GATEWAY_MOUNT = os.path.join(
     os.environ.get("LOCALAPPDATA", ""),
     "canopy", "Sync Dist", "gateway_shell", "mount.json"
 )
+
+
+def build_tin_index(xlsx_path):
+    """Build a TIN -> Client ID lookup from UltraTax export.
+
+    Indexes both taxpayer SSN and spouse SSN.
+    Returns dict of SSN -> (client_id, client_name)
+    """
+    index = {}
+    wb = openpyxl.load_workbook(xlsx_path, read_only=True)
+    ws = wb.active
+    for i, row in enumerate(ws.iter_rows(values_only=True)):
+        if i < 4:  # Skip header rows
+            continue
+        client_id = str(row[0] or "").strip()
+        client_name = str(row[1] or "").strip()
+        client_tin = str(row[3] or "").strip()
+        tp_ssn = str(row[5] or "").strip()
+        sp_ssn = str(row[6] or "").strip()
+
+        if not client_id:
+            continue
+        if tp_ssn and tp_ssn != "None":
+            index[tp_ssn] = (client_id, client_name)
+        if sp_ssn and sp_ssn != "None":
+            index[sp_ssn] = (client_id, client_name)
+        if client_tin and client_tin != "None" and client_tin not in index:
+            index[client_tin] = (client_id, client_name)
+
+    wb.close()
+    return index
+
+
+def extract_recipient_tin(pdf_path):
+    """Extract the recipient's SSN/TIN from a K-1 PDF.
+
+    Returns the first SSN (XXX-XX-XXXX) found in the PDF that is not
+    the entity's EIN.
+    """
+    ssns = set()
+    eins = set()
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages[:4]:  # K-1 info is in first few pages
+                text = page.extract_text() or ""
+                for ssn in re.findall(r"\d{3}-\d{2}-\d{4}", text):
+                    ssns.add(ssn)
+                for ein in re.findall(r"\d{2}-\d{7}", text):
+                    eins.add(ein)
+    except Exception:
+        pass
+    return ssns, eins
+
+
+def match_recipient_by_tin(pdf_path, tin_index, canopy_mapping):
+    """Match a K-1 recipient to a Canopy client using TIN extraction.
+
+    Returns (ext_id, canopy_name) or None
+    """
+    ssns, eins = extract_recipient_tin(pdf_path)
+
+    for ssn in ssns:
+        if ssn in tin_index:
+            client_id, ut_name = tin_index[ssn]
+            canopy_name = canopy_mapping.get(client_id)
+            if canopy_name:
+                return client_id, canopy_name
+    return None
 
 
 def build_recipient_index(csv_path):
@@ -217,18 +299,45 @@ def main():
     )
     parser.add_argument("--go", action="store_true", help="Upload K-1s to workpapers")
     parser.add_argument("--routed-dir", help="Path to Routed/ directory")
+    parser.add_argument("--staging-dir", help="Path to staging directory with original PDFs")
     parser.add_argument("--mapping-csv", help="Path to Canopy CSV")
+    parser.add_argument("--tin-file", help="Path to UltraTax TIN export (xlsx)")
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     config = load_config(os.path.join(script_dir, "config.ini"))
-    base_staging = config.get("staging_dir") or os.path.dirname(script_dir)
+    base_staging = args.staging_dir or config.get("staging_dir") or os.path.dirname(script_dir)
     routed_dir = args.routed_dir or os.path.join(base_staging, "Routed")
     mapping_csv = args.mapping_csv or config.get("mapping_csv") or find_mapping_csv(base_staging)
 
-    # Load mapping and recipient index
+    # Load mapping and indices
     mapping = load_canopy_mapping(mapping_csv)
     recipient_index = build_recipient_index(mapping_csv)
+
+    # Load TIN index if available
+    tin_file = args.tin_file
+    if not tin_file:
+        # Auto-detect TIN file in staging
+        import glob
+        tin_candidates = glob.glob(os.path.join(base_staging, "*TIN*.xlsx")) + \
+                        glob.glob(os.path.join(base_staging, "*tin*.xlsx"))
+        if tin_candidates:
+            tin_file = tin_candidates[0]
+
+    tin_index = {}
+    if tin_file and os.path.isfile(tin_file):
+        print(f"Loading TIN index from: {os.path.basename(tin_file)}")
+        tin_index = build_tin_index(tin_file)
+        print(f"  {len(tin_index)} TINs indexed")
+    else:
+        print("No TIN file found -- using name matching only")
+
+    # Build a map from original staging filenames to routed files
+    # so we can read the original PDF for TIN extraction
+    original_pdfs = {}
+    for f in os.listdir(base_staging):
+        if f.endswith(".pdf") and "K1" in f:
+            original_pdfs[f] = os.path.join(base_staging, f)
 
     # Find K-1s
     k1s = find_k1_in_routed(routed_dir)
@@ -239,12 +348,38 @@ def main():
     ambiguous = []
 
     for k1 in k1s:
-        result = match_recipient(k1["recipient"], recipient_index)
+        # Step 1: Try TIN matching (best method)
+        result = None
+        match_method = ""
+
+        if tin_index:
+            # Find the original PDF in staging for TIN extraction
+            # Match by client_id and recipient name
+            original = None
+            for orig_name, orig_path in original_pdfs.items():
+                if f"_{k1['client_id']}_" in orig_name and k1["recipient"].lower() in orig_name.lower():
+                    original = orig_path
+                    break
+
+            if original:
+                tin_result = match_recipient_by_tin(original, tin_index, mapping)
+                if tin_result:
+                    result = tin_result
+                    match_method = "TIN"
+
+        # Step 2: Fall back to name matching
+        if result is None:
+            name_result = match_recipient(k1["recipient"], recipient_index)
+            if name_result is not None and not isinstance(name_result, list):
+                result = name_result
+                match_method = "name"
+            elif isinstance(name_result, list):
+                # Try TIN to disambiguate
+                ambiguous.append((k1, name_result))
+                continue
 
         if result is None:
             unmatched.append(k1)
-        elif isinstance(result, list):
-            ambiguous.append((k1, result))
         else:
             ext_id, canopy_name = result
             wp_name = rename_k1_for_workpapers(
@@ -256,6 +391,7 @@ def main():
                 "recipient_canopy_name": canopy_name.rstrip("."),
                 "workpaper_filename": wp_name,
                 "remote_path": f"/Clients/{canopy_name.rstrip('.')}/{k1['year']}/Tax/Workpapers",
+                "match_method": match_method,
             })
 
     # Report
@@ -266,7 +402,8 @@ def main():
     if matched:
         print(f"\nMATCHED ({len(matched)}):")
         for m in matched:
-            print(f"  {m['recipient']} -> {m['recipient_canopy_name']}")
+            method = m.get("match_method", "?")
+            print(f"  {m['recipient']} -> {m['recipient_canopy_name']} [{method}]")
             print(f"    From: {m['entity_name']}")
             print(f"    File: {m['workpaper_filename']}")
             print(f"    Dest: {m['remote_path']}")
