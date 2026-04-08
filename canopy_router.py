@@ -116,10 +116,11 @@ def parse_filename(filename: str) -> dict:
         result["year"] = year_candidate
         remaining = remaining[:-1]
 
-    # Identify doc type: contains TR, TxRtrn, or K1
+    # Identify doc type: contains TR, TxRtrn, or K1 as whole words
+    # Must match word boundaries to avoid false positives like "Patrick"
     doc_type_idx = None
     for i, part in enumerate(remaining):
-        if re.search(r"(TR|TxRtrn|K1)", part, re.IGNORECASE):
+        if re.search(r"(?:^|\s)((?:Amended\s*)?(?:PC|CC)\s+(?:TR|TxRtrn|K1)|^(?:TR|TxRtrn|K1)$|^(?:PC|CC)\s+(?:TR|TxRtrn|K1))", part):
             doc_type_idx = i
             break
 
