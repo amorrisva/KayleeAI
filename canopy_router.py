@@ -75,33 +75,106 @@ def load_canopy_mapping(csv_path: str) -> dict:
     return mapping
 
 
+ENTITY_TYPES = {
+    "1040", "1040NR", "1040SR", "1040X",
+    "1065", "1120", "1120S", "1120F",
+    "990", "990PF", "990T",
+    "706", "709", "1041",
+    "5500",
+}
+
+DOC_TYPE_RE = re.compile(
+    r"(?:^|\s)((?:Amended\s*)?(?:PC|CC|GC)\s+(?:TR|TxRtrn|K1)"
+    r"|^(?:TR|TxRtrn|K1)$"
+    r"|^(?:PC|CC|GC)\s+(?:TR|TxRtrn|K1)"
+    r"|^CC\s*-\s*Action\s+Req"
+    r"|^CC\s+K1.*Action\s+Req"
+    r"|^K1$"
+    r")"
+)
+
+
+def _detect_format(parts):
+    """Detect whether this is old format (2022) or new format (2025+).
+
+    Old: ClientName_ClientID_[Recipient]_DocType_Jurisdiction_Year
+    New: ClientID_ClientName_[Recipient]_EntityType_DocType_[Jurisdiction]_Year
+
+    Returns 'new' if position 1 looks like a Client ID (XXXXX### pattern
+    or known ID), 'old' if position 2 does, otherwise 'unknown'.
+    """
+    if len(parts) < 3:
+        return "unknown"
+
+    # Check if position 1 (index 0) looks like a Client ID
+    # Client IDs are typically 5+ alpha chars + 3 digits, or all-numeric
+    p0 = parts[0]
+    p1 = parts[1]
+
+    # Client IDs: HEMMI015, ALDER001, THOMREUT, 12578822, etc.
+    # They are single words (no spaces) and often alphanumeric
+    id_pattern = r"^[A-Z]{3,}\d{0,}$"  # 3+ alpha chars, optional digits
+    p0_is_id = bool(re.match(id_pattern, p0, re.IGNORECASE)) or p0.isdigit()
+    p1_is_id = bool(re.match(id_pattern, p1, re.IGNORECASE)) or p1.isdigit()
+    # Names typically have spaces (but are in one segment due to underscore split)
+    # A segment with spaces is a name, not an ID
+    if " " in p0:
+        p0_is_id = False
+    if " " in p1:
+        p1_is_id = False
+
+    # Check if any part is a known entity type (strong signal for new format)
+    has_entity_type = any(p.upper() in ENTITY_TYPES for p in parts)
+
+    if p0_is_id and has_entity_type:
+        return "new"
+    elif p1_is_id and not p0_is_id:
+        return "old"
+    elif p0_is_id:
+        return "new"
+    elif p1_is_id:
+        return "old"
+
+    return "unknown"
+
+
 def extract_client_id(filename: str) -> str:
     """Extract Client ID from a PDF filename.
 
-    Filename format: ClientName_ClientID_[Recipient_]DocType_Jurisdiction_Year.pdf
-    The Client ID is always the second underscore-delimited segment.
+    Supports both old format (Client ID in position 2) and
+    new format (Client ID in position 1).
     """
     stem = filename.rsplit(".pdf", 1)[0] if filename.lower().endswith(".pdf") else filename
     parts = stem.split("_")
     if len(parts) < 3:
         return ""
-    return parts[1]
+
+    fmt = _detect_format(parts)
+    if fmt == "new":
+        return parts[0]
+    else:
+        return parts[1]
 
 
 def parse_filename(filename: str) -> dict:
     """Parse a UltraTax PDF filename into its components.
 
+    Supports two formats:
+    Old (2022): ClientName_ClientID_[Recipient]_DocType_Jurisdiction_Year
+    New (2025): ClientID_ClientName_[Recipient]_EntityType_DocType_[Jurisdiction]_Year
+
     Returns dict with keys: client_name, client_id, recipient, doc_type,
-    jurisdiction, year, copy_prefix, is_client_copy
+    entity_type, jurisdiction, year, copy_prefix, is_client_copy
     """
     stem = filename.rsplit(".pdf", 1)[0] if filename.lower().endswith(".pdf") else filename
     parts = stem.split("_")
 
     result = {
-        "client_name": parts[0] if len(parts) > 0 else "",
-        "client_id": parts[1] if len(parts) > 1 else "",
+        "client_name": "",
+        "client_id": "",
         "recipient": "",
         "doc_type": "",
+        "entity_type": "",
         "jurisdiction": "",
         "year": "",
         "copy_prefix": "",
@@ -112,19 +185,36 @@ def parse_filename(filename: str) -> dict:
     if len(parts) < 3:
         return result
 
-    remaining = parts[2:]
+    fmt = _detect_format(parts)
+
+    if fmt == "new":
+        # New: ClientID_ClientName_[Recipient]_EntityType_DocType_[Jurisdiction]_Year
+        result["client_id"] = parts[0]
+        result["client_name"] = parts[1]
+        remaining = parts[2:]
+    else:
+        # Old: ClientName_ClientID_[Recipient]_DocType_Jurisdiction_Year
+        result["client_name"] = parts[0]
+        result["client_id"] = parts[1]
+        remaining = parts[2:]
 
     # Year is always the last part
-    year_candidate = remaining[-1]
-    if re.match(r"^\d{4}$", year_candidate):
-        result["year"] = year_candidate
+    if remaining and re.match(r"^\d{4}$", remaining[-1]):
+        result["year"] = remaining[-1]
         remaining = remaining[:-1]
 
-    # Identify doc type: contains TR, TxRtrn, or K1 as whole words
-    # Must match word boundaries to avoid false positives like "Patrick"
+    # Find entity type
+    entity_idx = None
+    for i, part in enumerate(remaining):
+        if part.upper() in ENTITY_TYPES:
+            result["entity_type"] = part.upper()
+            entity_idx = i
+            break
+
+    # Find doc type
     doc_type_idx = None
     for i, part in enumerate(remaining):
-        if re.search(r"(?:^|\s)((?:Amended\s*)?(?:PC|CC)\s+(?:TR|TxRtrn|K1)|^(?:TR|TxRtrn|K1)$|^(?:PC|CC)\s+(?:TR|TxRtrn|K1))", part):
+        if DOC_TYPE_RE.search(part):
             doc_type_idx = i
             break
 
@@ -132,22 +222,31 @@ def parse_filename(filename: str) -> dict:
         raw_doc = remaining[doc_type_idx]
         result["doc_type"] = raw_doc
 
-        # Parse copy prefix (CC, PC, AmendedPC, etc.)
-        prefix_match = re.match(r"^(Amended\s*PC|CC|PC)\s+", raw_doc)
+        # Parse copy prefix
+        prefix_match = re.match(r"^(Amended\s*PC|CC|PC|GC)\s+", raw_doc)
         if prefix_match:
             result["copy_prefix"] = prefix_match.group(1)
             result["is_client_copy"] = raw_doc.startswith("CC")
 
-        # Everything before doc type is recipient
-        if doc_type_idx > 0:
-            result["recipient"] = " ".join(remaining[:doc_type_idx])
+        # Recipient is everything before entity_type and doc_type
+        first_special = min(
+            x for x in [entity_idx, doc_type_idx] if x is not None
+        )
+        if first_special > 0:
+            result["recipient"] = " ".join(remaining[:first_special])
 
-        # Everything after doc type is jurisdiction
+        # Jurisdiction is after doc type (but not entity type or year)
         after_doc = remaining[doc_type_idx + 1:]
-        if after_doc:
-            result["jurisdiction"] = after_doc[0]
+        for part in after_doc:
+            if part.upper() not in ENTITY_TYPES and not re.match(r"^\d{4}$", part):
+                result["jurisdiction"] = part
+                break
+    elif entity_idx is not None:
+        # Has entity type but no recognized doc type
+        if entity_idx > 0:
+            result["recipient"] = " ".join(remaining[:entity_idx])
     else:
-        # Fallback: no recognized doc type
+        # Fallback
         if remaining:
             result["doc_type"] = remaining[0]
             if len(remaining) > 1:
@@ -184,52 +283,75 @@ def normalize_doc_type(raw: str) -> str:
 def rename_for_canopy(filename: str, canopy_client_name: str = "") -> str:
     """Rename a UltraTax PDF filename for Canopy.
 
-    Client Copy (CC): <Year> - <Doc Type> - <Jurisdiction> [- <Recipient>] [- <Client>].pdf
-    Preparer Copy (PC/other): <Doc Type> - <Year> - <Jurisdiction> [- <Recipient>] [- <Client>].pdf
+    Conventions:
+      PC tax return:  PC <Jurisdiction> <EntityType> <Client> - <Year>.pdf
+      CC tax return:  <Year> <EntityType> Tax Return - <Jurisdiction> - <Client>.pdf
+      PC K-1:         PC K1 - <Year> <EntityType> - <Recipient> - <Entity>.pdf
+      K-1 (no PC):    K1 - <Year> <EntityType> - <Recipient> - <Entity>.pdf
 
-    Client name is truncated to fit within MAX_STEM_LENGTH.
+    Client/entity name is truncated to fit within MAX_STEM_LENGTH.
     """
     parsed = parse_filename(filename)
 
-    if not parsed["doc_type"] or not parsed["year"]:
-        return filename  # Can't rename, keep original
+    if not parsed["year"]:
+        return filename
 
-    doc_label = normalize_doc_type(parsed["doc_type"])
     year = parsed["year"]
     jurisdiction = parsed["jurisdiction"]
     recipient = parsed["recipient"]
+    entity_type = parsed.get("entity_type", "")
     client_name = canopy_client_name or parsed["client_name"]
+    doc_type = parsed.get("doc_type", "")
+    is_k1 = "K1" in doc_type.upper()
+    is_cc = parsed["is_client_copy"]
+    has_pc = doc_type.upper().startswith("PC")
+    is_amended = "amended" in doc_type.lower()
 
-    # Build the fixed parts (everything before client name)
-    if parsed["is_client_copy"]:
-        # Client copy: Year - Doc Type - Jurisdiction [- Recipient]
-        parts = [year, doc_label]
-        if jurisdiction:
-            parts.append(jurisdiction)
+    if is_k1:
+        # K-1: PC K1 - <Year> <EntityType> - <Recipient> - <Entity>.pdf
+        prefix = "PC K1" if has_pc else "K1"
+        et = f" {entity_type}" if entity_type else ""
+        fixed = f"{prefix} - {year}{et}"
+        # Add recipient, then entity name fills remaining space
         if recipient:
-            parts.append(recipient)
-    else:
-        # Preparer copy: Doc Type - Year - Jurisdiction [- Recipient]
-        parts = [doc_label, year]
+            fixed = f"{fixed} - {recipient}"
+        available = MAX_STEM_LENGTH - len(fixed) - 3
+        if available >= 5 and client_name:
+            short = client_name[:available].rstrip(" ,&.")
+            stem = f"{fixed} - {short}"
+        else:
+            stem = fixed
+
+    elif is_cc:
+        # CC: <Year> <EntityType> Tax Return - <Jurisdiction> - <Client>.pdf
+        et = f" {entity_type}" if entity_type else ""
+        fixed = f"{year}{et} Tax Return"
         if jurisdiction:
-            parts.append(jurisdiction)
-        if recipient:
-            parts.append(recipient)
+            fixed = f"{fixed} - {jurisdiction}"
+        available = MAX_STEM_LENGTH - len(fixed) - 3
+        if available >= 5 and client_name:
+            short = client_name[:available].rstrip(" ,&.")
+            stem = f"{fixed} - {short}"
+        else:
+            stem = fixed
 
-    fixed = " - ".join(parts)
-
-    # Calculate remaining space for client name
-    # Format: "<fixed> - <client>.pdf" = fixed + 3 (" - ") + client + 4 (.pdf)
-    available = MAX_STEM_LENGTH - len(fixed) - 3  # 3 for " - " separator
-
-    if available >= 8 and client_name:
-        # Truncate client name to fit
-        short_name = client_name[:available].rstrip(" ,&.")
-        stem = f"{fixed} - {short_name}"
     else:
-        stem = fixed
+        # PC: PC <Jurisdiction> <EntityType> <Client> - <Year>.pdf
+        # Amended: Amended PC <Jurisdiction> <EntityType> <Client> - <Year>.pdf
+        prefix_parts = ["Amended PC"] if is_amended else ["PC"]
+        if jurisdiction:
+            prefix_parts.append(jurisdiction)
+        if entity_type:
+            prefix_parts.append(entity_type)
+        prefix = " ".join(prefix_parts)
+        suffix = f" - {year}"
+        available = MAX_STEM_LENGTH - len(prefix) - len(suffix) - 1  # 1 for space
+        if available >= 5 and client_name:
+            short = client_name[:available].rstrip(" ,&.")
+            stem = f"{prefix} {short}{suffix}"
+        else:
+            stem = f"{prefix}{suffix}"
 
-    # Ensure we don't exceed the limit
     if len(stem) > MAX_STEM_LENGTH:
         stem = stem[:MAX_STEM_LENGTH].rstrip(" -.,&")
 

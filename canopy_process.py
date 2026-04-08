@@ -287,19 +287,23 @@ def match_k1_recipient(pdf_path, tin_index, canopy_mapping, recipient_name, name
 # ---------------------------------------------------------------------------
 # K-1 workpaper rename
 # ---------------------------------------------------------------------------
-def rename_k1_for_workpapers(filename, entity_name, recipient_name, year=None):
-    """Rename K-1 for recipient's workpapers: entity first, recipient last."""
+def rename_k1_for_workpapers(filename, entity_name, recipient_name,
+                              year=None, entity_type=""):
+    """Rename K-1 for recipient's workpapers.
+
+    Format: K1 - <Year> <EntityType> <Entity> - <Recipient>.pdf
+    """
     if not year:
         m = re.search(r"\b(20\d{2})\b", filename)
         year = m.group(1) if m else ""
     if not year:
         return filename
 
-    doc_prefix = "PC K1" if "PC" in filename.upper().split(" - ")[0] else "K1"
-    base = f"{doc_prefix} - {year}"
-    available = MAX_STEM_LENGTH - len(base) - 3
+    et = f" {entity_type}" if entity_type else ""
+    base = f"K1 - {year}{et}"
+    available = MAX_STEM_LENGTH - len(base) - 1  # space before entity
     short_entity = entity_name[:available].rstrip(" ,&.")
-    fixed = f"{base} - {short_entity}"
+    fixed = f"{base} {short_entity}"
 
     available = MAX_STEM_LENGTH - len(fixed) - 3
     if available >= 5 and recipient_name:
@@ -616,7 +620,8 @@ def process_files(staging_dir, dry_run=False, teams_webhook=None):
                 if match_result:
                     recip_id, recip_canopy_name, method = match_result
                     recip_canopy_name = recip_canopy_name.rstrip(".")
-                    wp_name = rename_k1_for_workpapers(new_name, canopy_name, recipient, year)
+                    entity_type = parsed.get("entity_type", "")
+                    wp_name = rename_k1_for_workpapers(new_name, canopy_name, recipient, year, entity_type)
                     wp_remote = f"/Clients/{recip_canopy_name}/{year}/Tax/Workpapers"
 
                     try:
