@@ -414,8 +414,13 @@ def generate_report(staging_dir, results, start_time):
             f.write("The K-1 was uploaded to the entity's Tax Files,\n")
             f.write("but no workpaper copy was created for the recipient.\n")
             f.write("TO FIX: No action needed unless the recipient should be a client.\n\n")
-            for recip, entity in results["external_k1_files"]:
-                f.write(f"  {recip} (from {entity})\n")
+            for entry in results["external_k1_files"]:
+                recip, entity = entry[0], entry[1]
+                fname = entry[2] if len(entry) > 2 else ""
+                f.write(f"  {recip} (from {entity})")
+                if fname:
+                    f.write(f" - {fname}")
+                f.write("\n")
             f.write("\n")
 
         if results.get("k1_wp_failures"):
@@ -489,8 +494,14 @@ def send_teams_webhook(webhook_url, report_path, results, has_issues):
     # External K-1s (informational, not an error)
     if has_external_k1:
         ext_lines = []
-        for recip, entity in results["external_k1_files"]:
-            ext_lines.append(f"- **{recip}** (from {entity})")
+        for entry in results["external_k1_files"]:
+            recip = entry[0]
+            entity = entry[1]
+            fname = entry[2] if len(entry) > 2 else ""
+            if fname:
+                ext_lines.append(f"- **{recip}** (from {entity}) - {fname}")
+            else:
+                ext_lines.append(f"- **{recip}** (from {entity})")
         ext_lines.append("")
         ext_lines.append("*Please verify these external K-1 recipients. They are not firm clients -- no workpaper copy was created.*")
         sections.append({
@@ -719,7 +730,7 @@ def process_files(staging_dir, dry_run=False, teams_webhook=None):
                 else:
                     logging.info(f"    K1 EXTERNAL: {recipient} (not a client)")
                     results["external_k1"] += 1
-                    results["external_k1_files"].append((recipient, canopy_name))
+                    results["external_k1_files"].append((recipient, canopy_name, new_name))
                     log_entry["k1_external"] = recipient
 
             results["processed_log"].append(log_entry)

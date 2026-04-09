@@ -188,9 +188,11 @@ def parse_filename(filename: str) -> dict:
     fmt = _detect_format(parts)
 
     if fmt == "new":
-        # New: ClientID_ClientName_[Recipient]_EntityType_DocType_[Jurisdiction]_Year
+        # New format: ClientID is position 1
+        # For K-1s: ClientID_Recipient_ClientName_EntityType_DocType_Year
+        # For others: ClientID_ClientName_EntityType_DocType_Jurisdiction_Year
         result["client_id"] = parts[0]
-        result["client_name"] = parts[1]
+        result["client_name"] = parts[1]  # May be swapped for K-1s below
         remaining = parts[2:]
     else:
         # Old: ClientName_ClientID_[Recipient]_DocType_Jurisdiction_Year
@@ -217,6 +219,22 @@ def parse_filename(filename: str) -> dict:
         if DOC_TYPE_RE.search(part):
             doc_type_idx = i
             break
+
+    # For new format K-1s: position 2 is the recipient, not client name.
+    # The client name is the segment just before entity_type.
+    # Detect: if this is new format AND has a K-1 doc type AND there's a
+    # segment between position 2 and the entity/doc type, then position 2
+    # is the recipient and the next segment is the real client name.
+    if fmt == "new" and doc_type_idx is not None:
+        is_k1 = "K1" in remaining[doc_type_idx].upper()
+        if is_k1 and entity_idx is not None and entity_idx > 0:
+            # remaining[0] is the real client name, position 2 (parts[1]) was recipient
+            result["recipient"] = result["client_name"]  # parts[1] was the recipient
+            result["client_name"] = remaining[0]           # remaining[0] is client name
+            # Adjust indices since we consumed remaining[0]
+            remaining = remaining[1:]
+            entity_idx -= 1
+            doc_type_idx -= 1
 
     if doc_type_idx is not None:
         raw_doc = remaining[doc_type_idx]
