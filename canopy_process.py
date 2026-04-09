@@ -261,7 +261,11 @@ def build_tin_index(staging_dir):
 
 
 def extract_recipient_tin(pdf_path):
-    """Extract all TINs (SSNs and EINs) from a K-1 PDF."""
+    """Extract all TINs (SSNs and EINs) from a K-1 PDF.
+
+    Also handles cases where PDF text extraction misformats an EIN
+    as an SSN (e.g., 86-1063359 extracted as 861-06-3359).
+    """
     tins = set()
     try:
         with pdfplumber.open(pdf_path) as pdf:
@@ -270,6 +274,10 @@ def extract_recipient_tin(pdf_path):
                 # SSNs: XXX-XX-XXXX
                 for ssn in re.findall(r"\d{3}-\d{2}-\d{4}", text):
                     tins.add(ssn)
+                    # Also try reformatting as EIN: XXX-XX-XXXX -> XX-XXXXXXX
+                    digits = ssn.replace("-", "")
+                    ein_reformat = f"{digits[:2]}-{digits[2:]}"
+                    tins.add(ein_reformat)
                 # EINs: XX-XXXXXXX
                 for ein in re.findall(r"\d{2}-\d{7}", text):
                     tins.add(ein)
@@ -738,7 +746,60 @@ def process_files(staging_dir, dry_run=False, teams_webhook=None):
 
         # Client matching
         if client_id not in mapping:
-            logging.warning(f"  [{idx}/{len(pdfs)}] UNMATCHED: {pdf} (Client ID {client_id})")
+            # Entity not in Canopy -- but if this is a K-1, still try
+            # to route the workpaper copy to the recipient
+            is_k1 = "K1" in parsed.get("doc_type", "")
+            recipient = parsed.get("recipient", "")
+
+            if is_k1 and recipient and not dry_run:
+                entity_name = parsed.get("client_name", client_id)
+                logging.warning(f"  [{idx}/{len(pdfs)}] UNMATCHED ENTITY: {pdf} (Client ID {client_id})")
+                logging.info(f"    Attempting K-1 workpaper routing for recipient: {recipient}")
+
+                match_result = None
+                try:
+                    match_result = match_k1_recipient(
+                        src, tin_index, mapping, recipient, name_index,
+                        entity_client_id=client_id
+                    )
+                except Exception as e:
+                    logging.warning(f"    K1 match error: {e}")
+
+                if match_result:
+                    recip_id, recip_canopy_name, method = match_result
+                    recip_canopy_name = recip_canopy_name.rstrip(".")
+                    entity_type = parsed.get("entity_type", "")
+                    wp_name = rename_k1_for_workpapers(
+                        pdf, entity_name, recipient, year, entity_type
+                    )
+                    wp_remote = f"/Clients/{recip_canopy_name}/{year}/Tax/Workpapers"
+
+                    try:
+                        with tempfile.TemporaryDirectory() as td:
+                            temp_file = os.path.join(td, wp_name)
+                            shutil.copy2(src, temp_file)
+                            ok_wp, msg_wp = uploader.upload_file(temp_file, wp_remote)
+                    except Exception as e:
+                        ok_wp, msg_wp = False, str(e)
+
+                    if ok_wp:
+                        logging.info(f"    K1 -> {recip_canopy_name}/Workpapers/ [{method}]")
+                        results["k1_routed"] += 1
+                    else:
+                        logging.warning(f"    K1 workpaper FAIL: {msg_wp}")
+                else:
+                    suggestions = find_possible_name_matches(recipient, mapping, name_index)
+                    if suggestions:
+                        suggest_str = ", ".join(f"{n} ({i})" for i, n, _ in suggestions)
+                        logging.info(f"    K1 EXTERNAL: {recipient} -- possible match: {suggest_str}")
+                    else:
+                        logging.info(f"    K1 EXTERNAL: {recipient} (not a client)")
+                    results["external_k1"] += 1
+                    results["external_k1_files"].append((recipient, entity_name, pdf, suggestions))
+
+            else:
+                logging.warning(f"  [{idx}/{len(pdfs)}] UNMATCHED: {pdf} (Client ID {client_id})")
+
             if not dry_run:
                 move_file(src, FAILED_UNMATCHED, staging_dir)
             results["unmatched"] += 1
