@@ -527,12 +527,12 @@ def generate_report(staging_dir, results, start_time):
 
 
 def send_teams_webhook(webhook_url, report_path, results, has_issues):
-    """Send one Teams card per run.
+    """Send one Teams card per run -- only for orange or red.
 
     Color logic:
     - Red: real errors (unmatched, upload failures, parse errors)
     - Orange: no errors but has external K-1s to verify
-    - Green: everything clean
+    - Green: no notification (everything clean)
     """
     if not webhook_url:
         return
@@ -550,8 +550,8 @@ def send_teams_webhook(webhook_url, report_path, results, has_issues):
         color = "FFA500"
         title = "CanopyRouter: Files Processed"
     else:
-        color = "00FF00"
-        title = "CanopyRouter: All Files Processed"
+        # Green = everything clean, no notification needed
+        return
 
     # Summary facts
     facts = [{"name": "Total Files", "value": str(results["total"])}]
