@@ -336,18 +336,25 @@ def find_possible_name_matches(recipient_name, canopy_mapping, name_index):
     return suggestions
 
 
-def match_k1_recipient(pdf_path, tin_index, canopy_mapping, recipient_name, name_index):
+def match_k1_recipient(pdf_path, tin_index, canopy_mapping, recipient_name, name_index,
+                       entity_client_id=""):
     """Match a K-1 recipient by TIN ONLY.
 
     Returns (client_id, canopy_name, method) or None.
     Name matching is never used for auto-upload -- only for suggestions
     in the exception report.
+
+    The entity_client_id is excluded from matches to avoid matching
+    the issuing entity's own EIN instead of the recipient's.
     """
     if tin_index and HAS_TIN_SUPPORT:
-        ssns = extract_recipient_tin(pdf_path)
-        for ssn in ssns:
-            if ssn in tin_index:
-                client_id, ut_name = tin_index[ssn]
+        tins = extract_recipient_tin(pdf_path)
+        for tin in tins:
+            if tin in tin_index:
+                client_id, ut_name = tin_index[tin]
+                # Skip if this TIN belongs to the issuing entity
+                if client_id == entity_client_id:
+                    continue
                 canopy_name = canopy_mapping.get(client_id)
                 if canopy_name:
                     return client_id, canopy_name, "TIN"
@@ -777,7 +784,8 @@ def process_files(staging_dir, dry_run=False, teams_webhook=None):
                 recipient = parsed["recipient"]
                 try:
                     match_result = match_k1_recipient(
-                        src, tin_index, mapping, recipient, name_index
+                        src, tin_index, mapping, recipient, name_index,
+                        entity_client_id=client_id
                     )
                 except Exception as e:
                     logging.warning(f"    K1 match error: {e}")
