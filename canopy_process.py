@@ -262,8 +262,20 @@ def build_name_index(csv_path):
     return index
 
 
+def _normalize_name(name):
+    """Normalize a name for fuzzy comparison: lowercase, strip punctuation."""
+    return re.sub(r"[^a-z0-9 ]", "", name.lower()).strip()
+
+
 def match_k1_recipient(pdf_path, tin_index, canopy_mapping, recipient_name, name_index):
-    """Match a K-1 recipient. Returns (client_id, canopy_name, method) or None."""
+    """Match a K-1 recipient. Returns (client_id, canopy_name, method) or None.
+
+    Matching priority:
+    1. TIN from PDF (most reliable)
+    2. Direct name match against Canopy clients (handles businesses)
+    3. First/last name index match (handles individuals + spouses)
+    """
+    # 1. TIN matching
     if tin_index and HAS_TIN_SUPPORT:
         ssns = extract_recipient_tin(pdf_path)
         for ssn in ssns:
@@ -273,6 +285,13 @@ def match_k1_recipient(pdf_path, tin_index, canopy_mapping, recipient_name, name
                 if canopy_name:
                     return client_id, canopy_name, "TIN"
 
+    # 2. Direct name match (normalized) -- catches businesses like CAMGEN LLC -> Camgen, LLC
+    norm_recip = _normalize_name(recipient_name)
+    for ext_id, canopy_name in canopy_mapping.items():
+        if _normalize_name(canopy_name) == norm_recip:
+            return ext_id, canopy_name, "name-exact"
+
+    # 3. Individual name index (first, last) -- catches individuals + spouses
     parts = recipient_name.strip().split()
     if len(parts) >= 2:
         first = parts[0].lower()
