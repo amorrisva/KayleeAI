@@ -184,55 +184,98 @@ def find_tin_file(staging_dir):
 # ---------------------------------------------------------------------------
 # TIN matching
 # ---------------------------------------------------------------------------
-def build_tin_index(xlsx_path):
-    """Build SSN -> (client_id, client_name) lookup from UltraTax export."""
-    index = {}
-    try:
-        wb = openpyxl.load_workbook(xlsx_path, read_only=True)
-    except PermissionError:
-        logging.error(
-            f"Cannot read TIN file (is it open in Excel?): {xlsx_path}\n"
-            f"  Close the file and retry. Falling back to name matching."
-        )
-        return {}
-    except Exception as e:
-        logging.error(f"Cannot read TIN file: {e}")
-        return {}
+def build_tin_index(staging_dir):
+    """Build TIN -> (client_id, client_name) lookup from BOTH UltraTax exports.
 
-    ws = wb.active
-    for i, row in enumerate(ws.iter_rows(values_only=True)):
-        if i < 4:
-            continue
-        client_id = str(row[0] or "").strip()
-        client_name = str(row[1] or "").strip()
-        tp_ssn = str(row[5] or "").strip()
-        sp_ssn = str(row[6] or "").strip()
-        client_tin = str(row[3] or "").strip()
-        if not client_id:
-            continue
-        if tp_ssn and tp_ssn != "None":
-            index[tp_ssn] = (client_id, client_name)
-        if sp_ssn and sp_ssn != "None":
-            index[sp_ssn] = (client_id, client_name)
-        if client_tin and client_tin != "None" and client_tin not in index:
-            index[client_tin] = (client_id, client_name)
-    wb.close()
+    Sources:
+    1. taxandspouseTIN.XLSX -- individual clients (SSN + spouse SSN)
+    2. UT25_GeneralClientInformation.xls -- all clients including businesses (EIN)
+    """
+    index = {}
+
+    # Source 1: Individual TIN export (SSNs)
+    config_dir = os.path.join(staging_dir, CONFIG_DIR)
+    tin_files = []
+    for search_dir in [config_dir, staging_dir]:
+        tin_files += glob.glob(os.path.join(search_dir, "*TIN*.xlsx"))
+        tin_files += glob.glob(os.path.join(search_dir, "*tin*.xlsx"))
+        tin_files += glob.glob(os.path.join(search_dir, "*TIN*.XLSX"))
+
+    if tin_files:
+        xlsx_path = max(set(tin_files), key=os.path.getmtime)
+        try:
+            wb = openpyxl.load_workbook(xlsx_path, read_only=True)
+            ws = wb.active
+            for i, row in enumerate(ws.iter_rows(values_only=True)):
+                if i < 4:
+                    continue
+                client_id = str(row[0] or "").strip()
+                client_name = str(row[1] or "").strip()
+                tp_ssn = str(row[5] or "").strip()
+                sp_ssn = str(row[6] or "").strip()
+                client_tin = str(row[3] or "").strip()
+                if not client_id:
+                    continue
+                if tp_ssn and tp_ssn != "None":
+                    index[tp_ssn] = (client_id, client_name)
+                if sp_ssn and sp_ssn != "None":
+                    index[sp_ssn] = (client_id, client_name)
+                if client_tin and client_tin != "None" and client_tin not in index:
+                    index[client_tin] = (client_id, client_name)
+            wb.close()
+            logging.info(f"Individual TINs: {len(index)} from {os.path.basename(xlsx_path)}")
+        except PermissionError:
+            logging.error(f"Cannot read TIN file (is it open in Excel?): {xlsx_path}")
+        except Exception as e:
+            logging.error(f"Cannot read TIN file: {e}")
+
+    # Source 2: General Client Information (EINs for businesses)
+    xls_files = []
+    for search_dir in [config_dir, staging_dir]:
+        xls_files += glob.glob(os.path.join(search_dir, "UT*GeneralClientInformation*.xls"))
+        xls_files += glob.glob(os.path.join(search_dir, "UT*GeneralClientInformation*.XLS"))
+
+    if xls_files:
+        xls_path = max(set(xls_files), key=os.path.getmtime)
+        try:
+            import xlrd
+            wb = xlrd.open_workbook(xls_path)
+            sheet = wb.sheet_by_index(0)
+            added = 0
+            for i in range(3, sheet.nrows):
+                client_id = str(sheet.cell_value(i, 0)).strip()
+                tin = str(sheet.cell_value(i, 7)).strip()
+                client_name = str(sheet.cell_value(i, 1)).strip()
+                if client_id and tin and tin not in index:
+                    index[tin] = (client_id, client_name)
+                    added += 1
+            logging.info(f"Business TINs: {added} from {os.path.basename(xls_path)}")
+        except ImportError:
+            logging.warning("xlrd not installed -- cannot read business TIN file")
+        except PermissionError:
+            logging.error(f"Cannot read business TIN file (is it open in Excel?): {xls_path}")
+        except Exception as e:
+            logging.error(f"Cannot read business TIN file: {e}")
+
     return index
 
 
 def extract_recipient_tin(pdf_path):
-    """Extract SSNs from a K-1 PDF."""
-    ssns = set()
+    """Extract all TINs (SSNs and EINs) from a K-1 PDF."""
+    tins = set()
     try:
         with pdfplumber.open(pdf_path) as pdf:
             for page in pdf.pages[:4]:
                 text = page.extract_text() or ""
+                # SSNs: XXX-XX-XXXX
                 for ssn in re.findall(r"\d{3}-\d{2}-\d{4}", text):
-                    ssns.add(ssn)
+                    tins.add(ssn)
+                # EINs: XX-XXXXXXX
+                for ein in re.findall(r"\d{2}-\d{7}", text):
+                    tins.add(ein)
     except Exception as e:
         logging.warning(f"TIN extraction failed for {os.path.basename(pdf_path)}: {e}")
-        logging.warning("  Falling back to name matching for this K-1.")
-    return ssns
+    return tins
 
 
 def build_name_index(csv_path):
@@ -263,19 +306,43 @@ def build_name_index(csv_path):
 
 
 def _normalize_name(name):
-    """Normalize a name for fuzzy comparison: lowercase, strip punctuation."""
+    """Normalize a name for comparison: lowercase, strip punctuation."""
     return re.sub(r"[^a-z0-9 ]", "", name.lower()).strip()
 
 
-def match_k1_recipient(pdf_path, tin_index, canopy_mapping, recipient_name, name_index):
-    """Match a K-1 recipient. Returns (client_id, canopy_name, method) or None.
+def find_possible_name_matches(recipient_name, canopy_mapping, name_index):
+    """Find possible matches by name for the exception report.
 
-    Matching priority:
-    1. TIN from PDF (most reliable)
-    2. Direct name match against Canopy clients (handles businesses)
-    3. First/last name index match (handles individuals + spouses)
+    Does NOT auto-match -- only returns suggestions for human review.
     """
-    # 1. TIN matching
+    suggestions = []
+
+    # Check normalized name against all Canopy clients
+    norm_recip = _normalize_name(recipient_name)
+    for ext_id, canopy_name in canopy_mapping.items():
+        if _normalize_name(canopy_name) == norm_recip:
+            suggestions.append((ext_id, canopy_name, "exact name"))
+
+    # Check first/last index for individuals
+    parts = recipient_name.strip().split()
+    if len(parts) >= 2:
+        first = parts[0].lower()
+        last = parts[-1].lower()
+        matches = name_index.get((first, last), [])
+        for ext_id, name in matches:
+            if (ext_id, name, "exact name") not in suggestions:
+                suggestions.append((ext_id, name, "first/last"))
+
+    return suggestions
+
+
+def match_k1_recipient(pdf_path, tin_index, canopy_mapping, recipient_name, name_index):
+    """Match a K-1 recipient by TIN ONLY.
+
+    Returns (client_id, canopy_name, method) or None.
+    Name matching is never used for auto-upload -- only for suggestions
+    in the exception report.
+    """
     if tin_index and HAS_TIN_SUPPORT:
         ssns = extract_recipient_tin(pdf_path)
         for ssn in ssns:
@@ -284,21 +351,6 @@ def match_k1_recipient(pdf_path, tin_index, canopy_mapping, recipient_name, name
                 canopy_name = canopy_mapping.get(client_id)
                 if canopy_name:
                     return client_id, canopy_name, "TIN"
-
-    # 2. Direct name match (normalized) -- catches businesses like CAMGEN LLC -> Camgen, LLC
-    norm_recip = _normalize_name(recipient_name)
-    for ext_id, canopy_name in canopy_mapping.items():
-        if _normalize_name(canopy_name) == norm_recip:
-            return ext_id, canopy_name, "name-exact"
-
-    # 3. Individual name index (first, last) -- catches individuals + spouses
-    parts = recipient_name.strip().split()
-    if len(parts) >= 2:
-        first = parts[0].lower()
-        last = parts[-1].lower()
-        matches = name_index.get((first, last), [])
-        if len(matches) == 1:
-            return matches[0][0], matches[0][1], "name"
 
     return None
 
@@ -436,10 +488,14 @@ def generate_report(staging_dir, results, start_time):
             for entry in results["external_k1_files"]:
                 recip, entity = entry[0], entry[1]
                 fname = entry[2] if len(entry) > 2 else ""
+                suggestions = entry[3] if len(entry) > 3 else []
                 f.write(f"  {recip} (from {entity})")
                 if fname:
                     f.write(f" - {fname}")
                 f.write("\n")
+                if suggestions:
+                    for sid, sname, smethod in suggestions:
+                        f.write(f"    Possible match: {sname} ({sid})\n")
             f.write("\n")
 
         if results.get("k1_wp_failures"):
@@ -517,12 +573,16 @@ def send_teams_webhook(webhook_url, report_path, results, has_issues):
             recip = entry[0]
             entity = entry[1]
             fname = entry[2] if len(entry) > 2 else ""
+            suggestions = entry[3] if len(entry) > 3 else []
+            line = f"- **{recip}** (from {entity})"
             if fname:
-                ext_lines.append(f"- **{recip}** (from {entity}) - {fname}")
-            else:
-                ext_lines.append(f"- **{recip}** (from {entity})")
+                line += f" - {fname}"
+            ext_lines.append(line)
+            if suggestions:
+                for sid, sname, smethod in suggestions:
+                    ext_lines.append(f"  - Possible match: **{sname}** ({sid})")
         ext_lines.append("")
-        ext_lines.append("*Please verify these external K-1 recipients. They are not firm clients -- no workpaper copy was created.*")
+        ext_lines.append("*No workpaper copy was created. If a possible match is correct, the TIN export files may need updating.*")
         sections.append({
             "activityTitle": "External K-1 Recipients - Please Verify",
             "text": "\n\n".join(ext_lines),
@@ -595,14 +655,13 @@ def process_files(staging_dir, dry_run=False, teams_webhook=None):
         )
         return {"total": 0, "errors": ["CSV locked"]}
 
-    tin_file = find_tin_file(staging_dir)
-    tin_index = build_tin_index(tin_file) if tin_file else {}
+    tin_index = build_tin_index(staging_dir) if HAS_TIN_SUPPORT else {}
     name_index = build_name_index(mapping_csv)
 
     if tin_index:
-        logging.info(f"TIN index: {len(tin_index)} entries from {os.path.basename(tin_file)}")
+        logging.info(f"TIN index: {len(tin_index)} total entries (individuals + businesses)")
     else:
-        logging.warning("No TIN file found -- K-1 matching will use names only (less accurate)")
+        logging.warning("No TIN files found -- K-1 workpaper copies will not be created automatically")
 
     # Find PDFs (only in root, not subdirectories)
     pdfs = sorted(
@@ -747,9 +806,17 @@ def process_files(staging_dir, dry_run=False, teams_webhook=None):
                         logging.warning(f"    K1 FAIL -> {recip_canopy_name}: {msg2}")
                         results["k1_wp_failures"].append((new_name, recip_canopy_name, msg2))
                 else:
-                    logging.info(f"    K1 EXTERNAL: {recipient} (not a client)")
+                    # Find possible name matches for the exception report
+                    suggestions = find_possible_name_matches(
+                        recipient, mapping, name_index
+                    )
+                    if suggestions:
+                        suggest_str = ", ".join(f"{n} ({i})" for i, n, _ in suggestions)
+                        logging.info(f"    K1 EXTERNAL: {recipient} -- possible match: {suggest_str}")
+                    else:
+                        logging.info(f"    K1 EXTERNAL: {recipient} (not a client)")
                     results["external_k1"] += 1
-                    results["external_k1_files"].append((recipient, canopy_name, new_name))
+                    results["external_k1_files"].append((recipient, canopy_name, new_name, suggestions))
                     log_entry["k1_external"] = recipient
 
             results["processed_log"].append(log_entry)
